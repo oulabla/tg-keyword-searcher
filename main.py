@@ -3,44 +3,42 @@ import re
 import sys
 import json
 import argparse
+import traceback
 from datetime import datetime, UTC
 from pathlib import Path
 from telethon import TelegramClient
 from telethon.tl.functions.messages import SearchGlobalRequest
 from telethon.tl.types import InputMessagesFilterEmpty, InputPeerEmpty
 import yaml
-from getpass import getpass
+from openai import OpenAI
+import lead  # ← ваш модуль lead.py
 
-# ────────────────────────────────────────────────
-# ВАШИ ДАННЫЕ
 # ────────────────────────────────────────────────
 SESSION_NAME = 'global_search_session'
 CRED_FILE    = "cred.yaml"
-DEFAULT_JSON = "result.json"
+DEFAULT_RESULT = "result.json"
+DEFAULT_INTERMEDIATE = "tg_result.json"
+LOG_DIR      = Path("log")
 
+# ────────────────────────────────────────────────
 
 def load_or_create_credentials(json_only=False):
     cred_path = Path(CRED_FILE)
-
     if cred_path.is_file() and cred_path.stat().st_size > 0:
         try:
             with open(cred_path, encoding="utf-8") as f:
                 data = yaml.safe_load(f)
-
             required = {"api_id", "api_hash", "phone"}
             if not isinstance(data, dict) or not required.issubset(data.keys()):
                 print("В файле cred.yaml отсутствуют некоторые обязательные поля.")
                 return ask_and_save_credentials()
-
             data["api_id"] = int(data["api_id"])
             if not json_only:
                 print("Успешно загружены данные из cred.yaml")
             return data
-
         except Exception as e:
             print(f"Ошибка чтения {CRED_FILE}: {e}")
             return ask_and_save_credentials()
-
     return ask_and_save_credentials()
 
 
@@ -67,11 +65,9 @@ def ask_and_save_credentials():
 
 async def global_search(client, keywords, limit_per_keyword=50, min_date=None, json_only=False):
     all_results = []
-
     for keyword in keywords:
         if not json_only:
             print(f"Поиск по: {keyword!r}", file=sys.stderr)
-
         offset_rate = 0
         offset_peer = InputPeerEmpty()
         offset_id   = 0
@@ -91,18 +87,15 @@ async def global_search(client, keywords, limit_per_keyword=50, min_date=None, j
                 ))
 
                 if not result.messages:
-                    print(f"  → больше нет результатов", file=sys.stderr)
                     break
 
                 for message in result.messages:
                     if not message.message:
                         continue
-
                     try:
                         chat   = await message.get_chat()
                         sender = await message.get_sender()
-                    except Exception as e:
-                        print(f"  Пропуск (chat/sender error): {e}", file=sys.stderr)
+                    except Exception:
                         continue
 
                     chat_title = (
@@ -152,144 +145,221 @@ async def global_search(client, keywords, limit_per_keyword=50, min_date=None, j
 
             except Exception as e:
                 err = str(e)
-                print(f"  Ошибка: {err}", file=sys.stderr)
-
                 if "FLOOD_WAIT" in err:
                     wait = 60
                     m = re.search(r'\b(\d+)\b', err)
-                    if m:
-                        wait = int(m.group(1))
-                    print(f"  FLOOD_WAIT → ждём ~{wait + 10} сек...", file=sys.stderr)
+                    if m: wait = int(m.group(1))
                     await asyncio.sleep(wait + 10)
                 elif any(x in err for x in ["PEER_ID_INVALID", "Cannot cast"]):
                     break
                 else:
                     await asyncio.sleep(5)
 
+    all_results.sort(key=lambda x: x['date'], reverse=True)
     return all_results
+
+
+def write_log(log_data):
+    LOG_DIR.mkdir(exist_ok=True)
+    today = datetime.now().strftime('%Y-%m-%d')
+    log_file = LOG_DIR / f"log_{today}.jsonl"
+
+    try:
+        with open(log_file, 'a', encoding='utf-8') as f:
+            json.dump(log_data, f, ensure_ascii=False)
+            f.write('\n')
+    except Exception as e:
+        print(f"Ошибка записи лога: {e}", file=sys.stderr)
 
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description="Глобальный поиск в Telegram по ключевым словам",
+        description="Глобальный поиск в Telegram + опциональный ИИ-фильтр лидов",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="""
 Примеры:
-  python %(prog)s "битрикс, 1С, bitrix" -l 30 -o bitrix.json
-  python %(prog)s "python django flask" --json-only
-  python %(prog)s "крипта, BTC" -j -l 100
+  python tg_search.py "битрикс, 1С, bitrix" -l 40 -o bitrix.json
+  python tg_search.py "python django" -j -l 80
+  python tg_search.py "крипта TON" -a 15 -g leads_ton.json
+  python tg_search.py "удалёнка" --since 2026-01-01 -a 10
         """
     )
-
-    # Позиционный аргумент — ключевые слова (обязательный)
-    parser.add_argument(
-        'keywords_str',
-        type=str,
-        help="Ключевые слова через запятую в кавычках (первый аргумент)"
-    )
-
-    # Остальные опциональные
-    parser.add_argument('-l', '--limit', type=int, default=50,
-                        help="Макс. количество сообщений на одно слово (по умолчанию 50)")
-    parser.add_argument('-o', '--output', type=str, default=DEFAULT_JSON,
-                        help=f"Имя выходного JSON-файла (по умолчанию: {DEFAULT_JSON})")
-    parser.add_argument('-j', '--json-only', action='store_true',
-                        help="Выводить в консоль только JSON и ничего больше")
-    parser.add_argument('--since', type=str, default=None,
-                        help="Дата в формате YYYY-MM-DD, начиная с которой искать")
-
+    parser.add_argument('keywords_str', type=str, help="Ключевые слова через запятую")
+    parser.add_argument('-l', '--limit', type=int, default=50, help="Макс. сообщений на слово (по умолчанию 50)")
+    parser.add_argument('-o', '--output', type=str, default=DEFAULT_RESULT, help="Файл с результатом (лиды или все сообщения)")
+    parser.add_argument('-i', '--intermediate', type=str, default=DEFAULT_INTERMEDIATE, help="Промежуточный файл с сырыми сообщениями")
+    parser.add_argument('-j', '--json-only', action='store_true', help="Только JSON в stdout, без лишнего текста")
+    parser.add_argument('--since', type=str, default=None, help="Дата с (YYYY-MM-DD)")
+    parser.add_argument('-a', '--ai', type=int, default=0, help="Включить ИИ-фильтр лидов, батч размером N (0 = выкл)")
     return parser.parse_args()
 
+
 async def main():
-    args = parse_arguments()
+    start_time = datetime.now(UTC).isoformat()
+    error_info = None
+    num_raw = 0
+    num_leads = 0
+    keywords = []
+    ai_enabled = False
+    args = None
 
-    # ─── Парсим ключевые слова из строки ───────────────────────────────
-    raw_keywords = args.keywords_str.strip()
-    if not raw_keywords:
-        print("Ошибка: нужно указать хотя бы одно ключевое слово", file=sys.stderr)
-        sys.exit(1)
+    try:
+        args = parse_arguments()
 
-    # Разбиваем по запятой и чистим
-    keywords = [kw.strip() for kw in raw_keywords.split(',') if kw.strip()]
-
-    if not keywords:
-        print("Ошибка: после разбора не осталось ни одного ключевого слова", file=sys.stderr)
-        sys.exit(1)
-
-    # Лимит
-    limit_per_kw = max(1, args.limit)
-
-    # Дата
-    min_date = None
-    if args.since:
-        try:
-            min_date = datetime.strptime(args.since, "%Y-%m-%d")
-        except ValueError:
-            print(f"Неверный формат даты: {args.since!r}. Ожидается YYYY-MM-DD", file=sys.stderr)
+        raw_kws = args.keywords_str.strip()
+        if not raw_kws:
+            print("Ошибка: укажите ключевые слова", file=sys.stderr)
             sys.exit(1)
 
-    creds = load_or_create_credentials(args.json_only)
+        keywords = [kw.strip() for kw in raw_kws.split(',') if kw.strip()]
+        if not keywords:
+            print("Нет валидных ключевых слов", file=sys.stderr)
+            sys.exit(1)
 
-    client = TelegramClient(SESSION_NAME, creds['api_id'], creds['api_hash'])
+        ai_enabled = args.ai > 0
+        limit_per_kw = max(1, args.limit)
 
-    if not args.json_only:
-        print("Запуск клиента...", file=sys.stderr)
+        min_date = None
+        if args.since:
+            try:
+                min_date = datetime.strptime(args.since, "%Y-%m-%d").replace(tzinfo=UTC)
+            except ValueError:
+                print(f"Неверный формат даты: {args.since}", file=sys.stderr)
+                sys.exit(1)
 
-    await client.start(phone=creds['phone'])
+        creds = load_or_create_credentials(args.json_only)
 
-    if not args.json_only:
-        print(f"Авторизация успешна\nКлючевые слова: {', '.join(keywords)!r}\n", file=sys.stderr)
+        client = TelegramClient(SESSION_NAME, creds['api_id'], creds['api_hash'])
+        await client.start(phone=creds['phone'])
 
-    results = await global_search(client, keywords, limit_per_keyword=limit_per_kw, min_date=min_date, json_only=args.json_only)
+        if not args.json_only:
+            print(f"Ключевые слова: {', '.join(keywords)}")
+            print(f"Лимит на слово: {limit_per_kw} | С: {args.since or 'начала времён'}")
+            if ai_enabled:
+                print(f"ИИ-фильтр включён, батч = {args.ai}\n")
 
-    # Сортируем от новых к старым
-    results.sort(key=lambda x: x['date'], reverse=True)
+        raw_messages = await global_search(
+            client,
+            keywords,
+            limit_per_keyword=limit_per_kw,
+            min_date=min_date,
+            json_only=args.json_only
+        )
+        num_raw = len(raw_messages)
 
-    output_data = {
-        "metadata": {
-            "keywords": keywords,
-            "limit_per_keyword": limit_per_kw,
-            "total_found": len(results),
-            "since": min_date.isoformat() if min_date else None,
-            "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z")
-        },
-        "results": results
-    }
+        # Сохраняем сырые результаты
+        intermediate_file = args.intermediate
+        Path(intermediate_file).parent.mkdir(parents=True, exist_ok=True)
+        with open(intermediate_file, 'w', encoding='utf-8') as f:
+            json.dump(raw_messages, f, ensure_ascii=False, indent=2)
 
-    json_str = json.dumps(output_data, ensure_ascii=False, indent=2)
+        final_results = raw_messages
+        if ai_enabled:
+            api_key, model = lead.get_gpt_cred()
+            if not api_key or not model:
+                raise ValueError("Не удалось загрузить OpenAI credentials")
 
-    if args.json_only:
-        print(json_str)
-        return
+            oai_client = OpenAI(api_key=api_key)
+            prompt_template = lead.get_prompt_text()
+            if not prompt_template:
+                raise ValueError("Промпт не найден")
 
-    # Обычный вывод
-    print(f"\nНайдено сообщений: {len(results)}\n", file=sys.stderr)
+            print(f"Обработка через ИИ ({model}), батч {args.ai}…")
+            leads = lead.find_leads(
+                raw_messages,
+                oai_client,
+                model,
+                prompt_template,
+                args.ai
+            )
+            final_results = leads
+            num_leads = len(leads)
 
-    for i, r in enumerate(results, 1):
-        date_str = r['date'][:19].replace("T", " ")
-        preview = r['text'].replace('\n', ' ').strip()
+            print(f"Найдено лидов после фильтра: {num_leads}")
 
-        print(f"#{i:03d}  {date_str}  [{r['chat_title']}]  {r['sender_name']}")
-        print(f"   {preview}")
-        if r['link']:
-            print(f"   → {r['link']}")
-        print("─" * 70)
+        # Вывод и сохранение
+        output_data = {
+            "metadata": {
+                "keywords": keywords,
+                "limit_per_keyword": limit_per_kw,
+                "since": min_date.isoformat() if min_date else None,
+                "ai_filter": ai_enabled,
+                "batch_size_ai": args.ai if ai_enabled else 0,
+                "total_raw": num_raw,
+                "total_leads": num_leads if ai_enabled else num_raw,
+                "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z")
+            },
+            "results": final_results
+        }
 
-    # Сохранение
-    try:
+        json_str = json.dumps(output_data, ensure_ascii=False, indent=2)
+
+        if args.json_only:
+            print(json_str)
+        else:
+            print(f"\nНайдено сообщений: {num_raw}")
+            if ai_enabled:
+                print(f"После ИИ-фильтра: {num_leads}\n")
+            else:
+                print()
+
+            for i, item in enumerate(final_results, 1):
+                date_str = item['date'][:19].replace("T", " ")
+                preview = item.get('text', item.get('message', ''))[:140].replace('\n', ' ').strip()
+                title = item.get('chat_title', '—')
+                link = item.get('link', '—')
+                print(f"#{i:03d}  {date_str}  [{title}]")
+                print(f"   {preview}…")
+                if link != '—':
+                    print(f"   → {link}")
+                print("─" * 70)
+
+        # Сохранение финального результата
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-        with open(args.output, "w", encoding="utf-8") as f:
+        with open(args.output, 'w', encoding='utf-8') as f:
             f.write(json_str)
-        print(f"\nРезультат сохранён → {args.output}", file=sys.stderr)
+        if not args.json_only:
+            print(f"\nСохранено → {args.output}")
+
     except Exception as e:
-        print(f"Ошибка сохранения: {e}", file=sys.stderr)
+        error_info = {
+            "message": str(e),
+            "traceback": traceback.format_exc()
+        }
+        print(f"Критическая ошибка: {e}", file=sys.stderr)
+        if not args.json_only:
+            traceback.print_exc()
+
+    finally:
+        end_time = datetime.now(UTC).isoformat()
+        duration = (datetime.fromisoformat(end_time) - datetime.fromisoformat(start_time)).total_seconds()
+
+        log_entry = {
+            "timestamp": start_time,
+            "end_time": end_time,
+            "duration_seconds": round(duration, 2),
+            "keywords": keywords,
+            "params": {
+                "limit_per_keyword": args.limit if args else 50,
+                "since": args.since if args else None,
+                "ai_filter": ai_enabled,
+                "batch_size_ai": args.ai if args else 0
+            },
+            "num_raw_messages": num_raw,
+            "num_leads_after_ai": num_leads,
+            "error": error_info
+        }
+        write_log(log_entry)
+
+        if error_info and not args.json_only:
+            sys.exit(1)
 
 
 if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nОстановлено пользователем", file=sys.stderr)
+        print("\nОстановлено пользователем")
     except Exception as e:
-        print(f"Критическая ошибка: {e}", file=sys.stderr)
+        print(f"Не удалось запустить: {e}")
         sys.exit(1)

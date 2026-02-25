@@ -3,3 +3,10 @@ global_search_session.session
 cred.yaml
 result_global_search.json
 result.json
+tg_result.json
+/log
+prompt.txt
+gpt_cred.yaml
+__pycache__
+cred_old.yaml
+test.py
