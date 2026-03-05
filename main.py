@@ -12,15 +12,94 @@ from telethon.tl.types import InputMessagesFilterEmpty, InputPeerEmpty
 import yaml
 from openai import OpenAI
 import lead  # ← ваш модуль lead.py
+import uuid
+import requests
 
 # ────────────────────────────────────────────────
 SESSION_NAME = 'global_search_session'
 CRED_FILE    = "cred.yaml"
+CLIENT_ID_FILE = "client_id.txt"
+NETLOG_URL   = "http://netlog.tw1.ru:8080/v1/netlog/create"
+APP_NAME     = "tg-global-leads-parser"          # ← желательно поменять на своё
+
 DEFAULT_RESULT = "result.json"
 DEFAULT_INTERMEDIATE = "tg_result.json"
 LOG_DIR      = Path("log")
 
 # ────────────────────────────────────────────────
+
+def get_or_create_client_id():
+    path = Path(CLIENT_ID_FILE)
+    if path.is_file():
+        try:
+            cid = path.read_text(encoding="utf-8").strip()
+            if cid and len(cid) > 20:
+                return cid
+        except:
+            pass
+
+    new_id = str(uuid.uuid4())
+    try:
+        path.write_text(new_id, encoding="utf-8")
+        print(f"Создан новый client_id → {new_id}")
+    except Exception as e:
+        print(f"Не удалось сохранить client_id: {e}", file=sys.stderr)
+
+    return new_id
+
+
+def send_netlog_to_server(
+    client_id,
+    keywords,
+    parameters,
+    num_raw,
+    num_leads,
+    error_msg=None,
+    result_before=None,
+    result_after=None
+):
+    payload = {
+        "netlog": {
+            "client_id": client_id,
+            "app_name": APP_NAME,
+            "keywords": keywords,
+            "parameters": parameters,
+            "num_before_ai_filter": num_raw,
+            "num_after_ai_filter": num_leads,
+        }
+    }
+
+    if error_msg:
+        payload["netlog"]["error"] = error_msg
+
+    if result_before:
+        payload["netlog"]["result_before_ai_filter"] = result_before
+
+    if result_after:
+        payload["netlog"]["result"] = result_after
+
+    try:
+        r = requests.post(
+            NETLOG_URL,
+            json=payload["netlog"],
+            timeout=10,
+            headers={"Content-Type": "application/json"}
+        )
+        r.raise_for_status()
+
+        try:
+            resp = r.json()
+            nid = resp.get("id")
+            if nid:
+                print(f"Лог отправлен → netlog id = {nid}")
+            else:
+                print("Лог отправлен, но id не вернулся")
+        except:
+            print("Лог отправлен, ответ не JSON")
+
+    except requests.RequestException as e:
+        print(f"Ошибка отправки лога на {NETLOG_URL}: {e}", file=sys.stderr)
+
 
 def load_or_create_credentials(json_only=False):
     cred_path = Path(CRED_FILE)
@@ -178,10 +257,10 @@ def parse_arguments():
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="""
 Примеры:
-  python tg_search.py "битрикс, 1С, bitrix" -l 40 -o bitrix.json
-  python tg_search.py "python django" -j -l 80
-  python tg_search.py "крипта TON" -a 15 -g leads_ton.json
-  python tg_search.py "удалёнка" --since 2026-01-01 -a 10
+  python main.py "битрикс, 1С, bitrix" -l 40 -o bitrix.json
+  python main.py "python django" -j -l 80
+  python main.py "крипта TON" -a 15 -g leads_ton.json
+  python main.py "удалёнка" --since 2026-01-01 -a 10
         """
     )
     parser.add_argument('keywords_str', type=str, help="Ключевые слова через запятую")
@@ -202,6 +281,8 @@ async def main():
     keywords = []
     ai_enabled = False
     args = None
+    raw_messages = []
+    leads = []
 
     try:
         args = parse_arguments()
@@ -215,6 +296,8 @@ async def main():
         if not keywords:
             print("Нет валидных ключевых слов", file=sys.stderr)
             sys.exit(1)
+
+        client_id = get_or_create_client_id()
 
         ai_enabled = args.ai > 0
         limit_per_kw = max(1, args.limit)
@@ -233,6 +316,7 @@ async def main():
         await client.start(phone=creds['phone'])
 
         if not args.json_only:
+            print(f"client_id   : {client_id}")
             print(f"Ключевые слова: {', '.join(keywords)}")
             print(f"Лимит на слово: {limit_per_kw} | С: {args.since or 'начала времён'}")
             if ai_enabled:
@@ -264,7 +348,9 @@ async def main():
             if not prompt_template:
                 raise ValueError("Промпт не найден")
 
-            print(f"Обработка через ИИ ({model}), батч {args.ai}…")
+            if not args.json_only:
+                print(f"Обработка через ИИ ({model}), батч {args.ai}…")
+
             leads = lead.find_leads(
                 raw_messages,
                 oai_client,
@@ -275,7 +361,8 @@ async def main():
             final_results = leads
             num_leads = len(leads)
 
-            print(f"Найдено лидов после фильтра: {num_leads}")
+            if not args.json_only:
+                print(f"Найдено лидов после фильтра: {num_leads}")
 
         # Вывод и сохранение
         output_data = {
@@ -318,6 +405,7 @@ async def main():
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)
         with open(args.output, 'w', encoding='utf-8') as f:
             f.write(json_str)
+
         if not args.json_only:
             print(f"\nСохранено → {args.output}")
 
@@ -326,8 +414,8 @@ async def main():
             "message": str(e),
             "traceback": traceback.format_exc()
         }
-        print(f"Критическая ошибка: {e}", file=sys.stderr)
-        if not args.json_only:
+        if not args or not args.json_only:
+            print(f"Критическая ошибка: {e}", file=sys.stderr)
             traceback.print_exc()
 
     finally:
@@ -351,7 +439,30 @@ async def main():
         }
         write_log(log_entry)
 
-        if error_info and not args.json_only:
+        # Подготовка данных для отправки на сервер
+        parameters = {
+            "limit_per_keyword": args.limit if args else 50,
+            "since": args.since if args else None,
+            "batch_size_ai": args.ai if args else 0,
+            "intermediate_file": args.intermediate if args else None,
+            "output_file": args.output if args else None,
+        }
+
+        result_before_wrapped = {"items": raw_messages} if num_raw > 0 else None
+        result_after_wrapped  = {"items": leads}        if num_leads > 0 else None
+
+        send_netlog_to_server(
+            client_id=client_id if 'client_id' in locals() else "unknown",
+            keywords=keywords,
+            parameters=parameters,
+            num_raw=num_raw,
+            num_leads=num_leads,
+            error_msg=error_info["message"] if error_info else None,
+            result_before=result_before_wrapped,
+            result_after=result_after_wrapped
+        )
+
+        if error_info and (not args or not args.json_only):
             sys.exit(1)
 
 
