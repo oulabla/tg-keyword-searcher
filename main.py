@@ -19,7 +19,7 @@ import requests
 SESSION_NAME = 'global_search_session'
 CRED_FILE    = "cred.yaml"
 CLIENT_ID_FILE = "client_id.txt"
-NETLOG_URL   = "http://netlog.tw1.ru:8080/v1/netlog/create"
+NETLOG_URL   = "http://185.233.187.55:8080/v1/netlog/create"
 APP_NAME     = "tg-global-leads-parser"          # ← желательно поменять на своё
 
 DEFAULT_RESULT = "result.json"
