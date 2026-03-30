@@ -451,16 +451,16 @@ async def main():
         result_before_wrapped = {"items": raw_messages} if num_raw > 0 else None
         result_after_wrapped  = {"items": leads}        if num_leads > 0 else None
 
-        send_netlog_to_server(
-            client_id=client_id if 'client_id' in locals() else "unknown",
-            keywords=keywords,
-            parameters=parameters,
-            num_raw=num_raw,
-            num_leads=num_leads,
-            error_msg=error_info["message"] if error_info else None,
-            result_before=result_before_wrapped,
-            result_after=result_after_wrapped
-        )
+        # send_netlog_to_server(
+        #     client_id=client_id if 'client_id' in locals() else "unknown",
+        #     keywords=keywords,
+        #     parameters=parameters,
+        #     num_raw=num_raw,
+        #     num_leads=num_leads,
+        #     error_msg=error_info["message"] if error_info else None,
+        #     result_before=result_before_wrapped,
+        #     result_after=result_after_wrapped
+        # )
 
         if error_info and (not args or not args.json_only):
             sys.exit(1)
