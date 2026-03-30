@@ -391,7 +391,7 @@ async def main():
                 print()
 
             for i, item in enumerate(final_results, 1):
-                date_str = item['date'][:19].replace("T", " ")
+                date_str = item['date'] #[:19].replace("T", " ")
                 preview = item.get('text', item.get('message', ''))[:140].replace('\n', ' ').strip()
                 title = item.get('chat_title', '—')
                 link = item.get('link', '—')
